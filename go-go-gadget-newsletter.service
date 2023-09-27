@@ -1,0 +1,11 @@
+[Unit]
+Description=Go-Go-Gadget Newsletter
+After=network.target
+
+[Service]
+ExecStart=/home/ubuntu/newsletter-arm
+User=root
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

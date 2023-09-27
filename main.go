@@ -97,7 +97,7 @@ func (s *Session) Data(r io.Reader) error {
 	}
 
 	// TODO: Consider capping the feed length.
-	// Kill-the-newsletter uses 500,000
+	// Kill-the-newsletter uses 500,000 bytes
 	return nil
 }
 
@@ -130,7 +130,7 @@ func getFeedFromTitle(db *sql.DB, title string) (Feed, error) {
 }
 
 func openDb() *sql.DB {
-	db, err := sql.Open("sqlite3", "./foo.db")
+	db, err := sql.Open("sqlite3", "./go-go-gadget-newsletter.db")
 	if err != nil {
 		log.Panic(err)
 	}
