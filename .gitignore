@@ -1,3 +1,4 @@
 *.db
 newsletter-arm
 newsletter-x86
+.vscode
