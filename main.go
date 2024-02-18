@@ -3,12 +3,14 @@ package main
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/go-co-op/gocron/v2"
 	"github.com/google/uuid"
 	"github.com/gorilla/feeds"
 	"github.com/julienschmidt/httprouter"
@@ -249,6 +251,45 @@ func handleAlternate(w http.ResponseWriter, r *http.Request, ps httprouter.Param
 
 func main() {
 	initDb()
+
+	// Cleanup cron task
+	scheduler, err := gocron.NewScheduler()
+	if err != nil {
+		log.Fatal(err)
+	}
+	j, err := scheduler.NewJob(
+		gocron.DurationJob(
+			24*time.Hour,
+		),
+		gocron.NewTask(
+			func() {
+				db := openDb()
+				defer db.Close()
+
+				log.Print("Running cleanup task")
+				_, err = db.Exec(`DELETE FROM entries WHERE createdAt < DATE('now', '-3 months')`)
+				if err != nil {
+					log.Fatal(err)
+				}
+				log.Print("Cleanup successful")
+			},
+		),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// each job has a unique id
+	fmt.Println(j.ID())
+
+	// start the scheduler
+	scheduler.Start()
+
+	err = j.RunNow()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// SMTP Server
 	be := &Backend{}
 
 	s := smtp.NewServer(be)
@@ -264,12 +305,13 @@ func main() {
 	log.Println("Starting mail server at", s.Addr)
 	go s.ListenAndServe()
 
+	// HTTP Server
 	router := httprouter.New()
 	router.GET("/feeds/:feedReference", handleFeed)
 	router.GET("/alternates/:entryReference", handleAlternate)
 
 	log.Println("Starting http server at", ":80")
-	err := http.ListenAndServe(":80", router)
+	err = http.ListenAndServe(":80", router)
 	if err != nil {
 		log.Fatal(err)
 	}
