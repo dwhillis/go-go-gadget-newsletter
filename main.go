@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/mail"
 	"strings"
 	"time"
 
@@ -14,6 +13,7 @@ import (
 	"github.com/gorilla/feeds"
 	"github.com/julienschmidt/httprouter"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/mnako/letters"
 
 	"github.com/emersion/go-smtp"
 )
@@ -49,26 +49,20 @@ func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
 }
 
 func (s *Session) Data(r io.Reader) error {
-	m, err := mail.ReadMessage(r)
+	email, err := letters.ParseEmail(r)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	header := m.Header
 	log.Println("Received new email")
-	log.Println("Date:", header.Get("Date"))
-	log.Println("To:", header.Get("To"))
-	log.Println("From:", header.Get("From"))
-	log.Println("Subject:", header.Get("Subject"))
-
-	body, err := io.ReadAll(m.Body)
-	if err != nil {
-		log.Fatal(err)
-	}
+	log.Println("Date:", email.Headers.Date)
+	log.Println("To:", email.Headers.To[0].Address)
+	log.Println("From:", email.Headers.From[0].Address)
+	log.Println("Subject:", email.Headers.Subject)
 
 	db := openDb()
 	defer db.Close()
-	feedTitle := strings.Split(header.Get("To"), "@")[0]
+	feedTitle := strings.Split(email.Headers.To[0].Address, "@")[0]
 	feed, err := getFeedFromTitle(db, feedTitle)
 	if err == ErrIDNotFound {
 		log.Println(feedTitle + " does not exist. Creating feed.")
@@ -82,19 +76,15 @@ func (s *Session) Data(r io.Reader) error {
 		}
 	}
 
-	title := header.Get("Subject")
-	address, err := mail.ParseAddress(header.Get("From"))
-	if err != nil {
-		log.Fatal(err)
-	}
-	author := address.Name
+	title := email.Headers.Subject
+	author := email.Headers.From[0].Name
 	_, err = db.Exec(`INSERT INTO entries(reference, feed, title, author, content) 
 	VALUES(?, ?, ?, ?, ?)`,
 		uuid.NewString(),
 		feed.id,
 		title,
 		author,
-		body)
+		email.HTML)
 
 	if err != nil {
 		log.Fatal(err)
