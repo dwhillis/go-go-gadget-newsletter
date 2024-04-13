@@ -1,0 +1,41 @@
+name: Makefile CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Build
+      run: make
+
+    - name: Upload arm binary to release
+      uses: svenstaro/upload-release-action@v2
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        file: newsletter-arm
+        asset_name: newsletter-arm
+        tag: ${{ github.ref }}
+        overwrite: true
+        body: ""
+        
+    - name: Upload arm binary to release
+      uses: svenstaro/upload-release-action@v2
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        file: newsletter-x86
+        asset_name: newsletter-x86
+        tag: ${{ github.ref }}
+        overwrite: true
+        body: ""
+      
+
+      
