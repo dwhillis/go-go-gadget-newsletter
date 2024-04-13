@@ -1,4 +1,5 @@
 # Go-Go-Gadget Newsletter
+[![Makefile CI](https://github.com/dwhillis/go-go-gadget-newsletter/actions/workflows/makefile.yml/badge.svg)](https://github.com/dwhillis/go-go-gadget-newsletter/actions/workflows/makefile.yml)
 ## Why does this exist
 Based off of [Kill the Newsletter](https://github.com/leafac/kill-the-newsletter), this is a go based service that converts emails into an RSS feed.
 

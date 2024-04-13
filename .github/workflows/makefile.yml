@@ -14,6 +14,21 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
+    - name: Get next version
+      uses: reecetech/version-increment@2023.9.3
+      id: version
+      with:
+        scheme: calver
+
+    - uses: actions/setup-go@v2
+
+    - name: Install cross compiler
+      run: sudo apt install -y gcc-aarch64-linux-gnu; sudo dpkg --add-architecture armhf
+
+    - uses: dominikh/staticcheck-action@v1
+      with:
+        version: "latest"
+
     - name: Build
       run: make
 
@@ -23,17 +38,27 @@ jobs:
         repo_token: ${{ secrets.GITHUB_TOKEN }}
         file: newsletter-arm
         asset_name: newsletter-arm
-        tag: ${{ github.ref }}
+        tag: ${{steps.version.outputs.current-version}}
         overwrite: true
         body: ""
         
-    - name: Upload arm binary to release
+    - name: Upload x86 binary to release
       uses: svenstaro/upload-release-action@v2
       with:
         repo_token: ${{ secrets.GITHUB_TOKEN }}
         file: newsletter-x86
         asset_name: newsletter-x86
-        tag: ${{ github.ref }}
+        tag: ${{steps.version.outputs.current-version}}
+        overwrite: true
+        body: ""
+
+    - name: Upload service file to release
+      uses: svenstaro/upload-release-action@v2
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        file: go-go-gadget-newsletter.service
+        asset_name: go-go-gadget-newsletter.service
+        tag: ${{steps.version.outputs.current-version}}
         overwrite: true
         body: ""
       
