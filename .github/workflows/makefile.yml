@@ -14,6 +14,15 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
+    - uses: actions/setup-go@v2
+
+    - name: Install cross compiler
+      run: sudo apt install -y gcc-aarch64-linux-gnu; sudo dpkg --add-architecture armhf
+
+    - uses: dominikh/staticcheck-action@v1
+      with:
+        version: "latest"
+
     - name: Build
       run: make
 
