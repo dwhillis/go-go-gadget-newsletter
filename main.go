@@ -170,28 +170,22 @@ func initDb() {
 	}
 }
 
-func makeSelfRef(r *http.Request, path string, value string) string {
+func makeBasePath(r *http.Request) string {
 	proto := "http"
 	if r.TLS != nil {
 		proto = "https"
 	}
-	return proto + "://" + r.Host + "/" + path + "/" + value
+	return proto + "://" + r.Host
 }
 
-func handleFeed(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	feedReference := ps.ByName("feedReference")
-	db := openDb()
-	defer db.Close()
+func makeSelfRef(basePath string, path string, value string) string {
+	return basePath + "/" + path + "/" + value
+}
 
-	feed, err := getFeedFromTitle(db, feedReference)
-	if err != nil {
-		io.WriteString(w, "Feed not found")
-		return
-	}
-
+func renderFeed(db *sql.DB, feed Feed, basePath string) string {
 	outputFeed := feeds.Feed{
 		Title:       feed.title,
-		Link:        &feeds.Link{Href: makeSelfRef(r, "feeds", feed.reference)},
+		Link:        &feeds.Link{Href: makeSelfRef(basePath, "feeds", feed.reference)},
 		Description: "",
 		Author:      &feeds.Author{Name: feed.title},
 		Created:     feed.createdAt}
@@ -215,7 +209,7 @@ func handleFeed(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 			log.Fatal(err)
 		}
 		item.Author = &feeds.Author{Name: author}
-		item.Link = &feeds.Link{Href: makeSelfRef(r, "alternates", reference)}
+		item.Link = &feeds.Link{Href: makeSelfRef(basePath, "alternates", reference)}
 		outputFeedItems = append(outputFeedItems, &item)
 	}
 	outputFeed.Items = outputFeedItems
@@ -223,6 +217,22 @@ func handleFeed(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	return rssFeed
+}
+
+func handleFeed(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	feedReference := ps.ByName("feedReference")
+	db := openDb()
+	defer db.Close()
+
+	feed, err := getFeedFromTitle(db, feedReference)
+	if err != nil {
+		io.WriteString(w, "Feed not found")
+		return
+	}
+
+	rssFeed := renderFeed(db, feed, makeBasePath(r))
 
 	w.Header().Set("Content-Type", "application/atom+xml")
 	w.Header().Set("X-Robots-Tag", "noindex")
@@ -249,6 +259,59 @@ func handleAlternate(w http.ResponseWriter, r *http.Request, ps httprouter.Param
 	io.WriteString(w, content)
 }
 
+func getFeeds(db *sql.DB) []Feed {
+	entryRows, err := db.Query("SELECT * FROM feeds")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer entryRows.Close()
+
+	feeds := []Feed{}
+	for entryRows.Next() {
+		feed := Feed{}
+		err = entryRows.Scan(&feed.id, &feed.createdAt, &feed.updatedAt, &feed.reference, &feed.title)
+		if err != nil {
+			log.Fatal(err)
+		}
+		feeds = append(feeds, feed)
+	}
+	return feeds
+}
+
+func cleanup() {
+	db := openDb()
+	defer db.Close()
+
+	log.Print("Running cleanup task")
+	_, err := db.Exec(`DELETE FROM entries WHERE createdAt < DATE('now', '-3 months')`)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Print("3 Month Cleanup successful")
+
+	feeds := getFeeds(db)
+
+	for _, feed := range feeds {
+		keepChecking := true
+		for keepChecking {
+			renderedFeed := renderFeed(db, feed, "http://google.com")
+			feedLength := len(renderedFeed)
+			log.Printf("%v is %v bytes long\n", feed.title, feedLength)
+			if feedLength > 10000000 {
+				log.Println("That's too long. Deleting the last entry")
+				_, err := db.Exec(`DELETE FROM entries WHERE id = (SELECT id FROM entries WHERE feed = ? ORDER BY createdAt ASC LIMIT 1)`, feed.id)
+				if err != nil {
+					log.Fatal(err)
+				}
+				keepChecking = true
+			} else {
+				keepChecking = false
+			}
+		}
+
+	}
+}
+
 func main() {
 	initDb()
 
@@ -261,19 +324,7 @@ func main() {
 		gocron.DurationJob(
 			24*time.Hour,
 		),
-		gocron.NewTask(
-			func() {
-				db := openDb()
-				defer db.Close()
-
-				log.Print("Running cleanup task")
-				_, err = db.Exec(`DELETE FROM entries WHERE createdAt < DATE('now', '-3 months')`)
-				if err != nil {
-					log.Fatal(err)
-				}
-				log.Print("Cleanup successful")
-			},
-		),
+		gocron.NewTask(cleanup),
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -310,8 +361,8 @@ func main() {
 	router.GET("/feeds/:feedReference", handleFeed)
 	router.GET("/alternates/:entryReference", handleAlternate)
 
-	log.Println("Starting http server at", ":80")
-	err = http.ListenAndServe(":80", router)
+	log.Println("Starting http server at", ":8080")
+	err = http.ListenAndServe(":8080", router)
 	if err != nil {
 		log.Fatal(err)
 	}
