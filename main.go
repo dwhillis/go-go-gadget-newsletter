@@ -138,10 +138,8 @@ func openDb() *sql.DB {
 	}
 	return db
 }
-func initDb() {
-	db := openDb()
-	defer db.Close()
 
+func initDb(db *sql.DB) {
 	sql := `
 	CREATE TABLE IF NOT EXISTS "feeds" (
         "id" INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -313,7 +311,9 @@ func cleanup() {
 }
 
 func main() {
-	initDb()
+	db := openDb()
+	initDb(db)
+	db.Close()
 
 	// Cleanup cron task
 	scheduler, err := gocron.NewScheduler()
