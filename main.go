@@ -210,15 +210,16 @@ func renderFeed(db *sql.DB, feed Feed, basePath string) string {
 		}
 		item.Author = &feeds.Author{Name: author}
 		item.Link = &feeds.Link{Href: makeSelfRef(basePath, "alternates", reference)}
+		item.Description = item.Content
 		outputFeedItems = append(outputFeedItems, &item)
 	}
 	outputFeed.Items = outputFeedItems
-	rssFeed, err := (&feeds.Rss{Feed: &outputFeed}).ToRss()
+	atomFeed, err := (&feeds.Atom{Feed: &outputFeed}).ToAtom()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	return rssFeed
+	return atomFeed
 }
 
 func handleFeed(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
@@ -232,12 +233,12 @@ func handleFeed(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 		return
 	}
 
-	rssFeed := renderFeed(db, feed, makeBasePath(r))
+	atomFeed := renderFeed(db, feed, makeBasePath(r))
 
-	w.Header().Set("Content-Type", "application/atom+xml")
+	w.Header().Set("Content-Type", "application/atom+xml; charset=utf-8")
 	w.Header().Set("X-Robots-Tag", "noindex")
 
-	io.WriteString(w, rssFeed)
+	io.WriteString(w, atomFeed)
 }
 
 func handleAlternate(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
