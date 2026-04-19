@@ -21,14 +21,17 @@ import (
 )
 
 // The Backend implements SMTP server methods.
-type Backend struct{}
+type Backend struct{
+	db *sql.DB
+}
 
 func (bkd *Backend) NewSession(_ *smtp.Conn) (smtp.Session, error) {
-	return &Session{}, nil
+	return &Session{db: bkd.db}, nil
 }
 
 // A Session is returned after EHLO.
 type Session struct {
+	db   *sql.DB
 	auth bool
 	from string
 	to   string
@@ -53,34 +56,50 @@ func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
 func (s *Session) Data(r io.Reader) error {
 	email, err := letters.ParseEmail(r)
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Error parsing email: %v", err)
+		return err
+	}
+
+	toAddress := s.to
+	if len(email.Headers.To) > 0 && email.Headers.To[0].Address != "" {
+		toAddress = email.Headers.To[0].Address
+	}
+
+	fromAddress := "unknown"
+	author := "unknown"
+	if len(email.Headers.From) > 0 {
+		fromAddress = email.Headers.From[0].Address
+		if email.Headers.From[0].Name != "" {
+			author = email.Headers.From[0].Name
+		} else {
+			author = fromAddress
+		}
 	}
 
 	log.Println("Received new email")
 	log.Println("Date:", email.Headers.Date)
-	log.Println("To:", email.Headers.To[0].Address)
-	log.Println("From:", email.Headers.From[0].Address)
+	log.Println("To:", toAddress)
+	log.Println("From:", fromAddress)
 	log.Println("Subject:", email.Headers.Subject)
 
-	db := openDb()
-	defer db.Close()
-	feedTitle := strings.Split(email.Headers.To[0].Address, "@")[0]
-	feed, err := getFeedFromTitle(db, feedTitle)
+	feedTitle := strings.Split(s.to, "@")[0]
+	feed, err := getFeedFromTitle(s.db, feedTitle)
 	if err == ErrIDNotFound {
 		log.Println(feedTitle + " does not exist. Creating feed.")
-		_, err = db.Exec(`INSERT INTO feeds(reference, title) VALUES(?, ?)`, feedTitle, feedTitle)
+		_, err = s.db.Exec(`INSERT INTO feeds(reference, title) VALUES(?, ?)`, feedTitle, feedTitle)
 		if err != nil {
-			log.Fatal(err)
+			log.Printf("Error inserting new feed: %v", err)
+			return err
 		}
-		feed, err = getFeedFromTitle(db, feedTitle)
+		feed, err = getFeedFromTitle(s.db, feedTitle)
 		if err != nil {
-			log.Fatal(err)
+			log.Printf("Error retrieving newly created feed: %v", err)
+			return err
 		}
 	}
 
 	title := email.Headers.Subject
-	author := email.Headers.From[0].Name
-	_, err = db.Exec(`INSERT INTO entries(reference, feed, title, author, content) 
+	_, err = s.db.Exec(`INSERT INTO entries(reference, feed, title, author, content)
 	VALUES(?, ?, ?, ?, ?)`,
 		uuid.NewString(),
 		feed.id,
@@ -89,13 +108,15 @@ func (s *Session) Data(r io.Reader) error {
 		email.HTML)
 
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Error inserting new entry: %v", err)
+		return err
 	}
 
-	_, err = db.Exec(`UPDATE "feeds" SET "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = ?`, feed.id)
+	_, err = s.db.Exec(`UPDATE "feeds" SET "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = ?`, feed.id)
 
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Error updating feed timestamp: %v", err)
+		return err
 	}
 
 	// TODO: Consider capping the feed length.
@@ -138,10 +159,7 @@ func openDb() *sql.DB {
 	}
 	return db
 }
-func initDb() {
-	db := openDb()
-	defer db.Close()
-
+func initDb(db *sql.DB) {
 	sql := `
 	CREATE TABLE IF NOT EXISTS "feeds" (
         "id" INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -182,7 +200,7 @@ func makeSelfRef(basePath string, path string, value string) string {
 	return basePath + "/" + path + "/" + value
 }
 
-func renderFeed(db *sql.DB, feed Feed, basePath string) string {
+func renderFeed(db *sql.DB, feed Feed, basePath string) (string, error) {
 	outputFeed := feeds.Feed{
 		Title:       feed.title,
 		Link:        &feeds.Link{Href: makeSelfRef(basePath, "feeds", feed.reference)},
@@ -195,7 +213,7 @@ func renderFeed(db *sql.DB, feed Feed, basePath string) string {
 	WHERE "feed" = ?
 	ORDER BY "id" DESC`, feed.id)
 	if err != nil {
-		log.Fatal(err)
+		return "", err
 	}
 	defer entryRows.Close()
 
@@ -206,7 +224,7 @@ func renderFeed(db *sql.DB, feed Feed, basePath string) string {
 		var author string
 		err := entryRows.Scan(&item.Id, &item.Created, &reference, &item.Title, &author, &item.Content)
 		if err != nil {
-			log.Fatal(err)
+			return "", err
 		}
 		item.Author = &feeds.Author{Name: author}
 		item.Link = &feeds.Link{Href: makeSelfRef(basePath, "alternates", reference)}
@@ -216,54 +234,59 @@ func renderFeed(db *sql.DB, feed Feed, basePath string) string {
 	outputFeed.Items = outputFeedItems
 	atomFeed, err := (&feeds.Atom{Feed: &outputFeed}).ToAtom()
 	if err != nil {
-		log.Fatal(err)
+		return "", err
 	}
 
-	return atomFeed
+	return atomFeed, nil
 }
 
-func handleFeed(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	feedReference := ps.ByName("feedReference")
-	db := openDb()
-	defer db.Close()
+func handleFeed(db *sql.DB) httprouter.Handle {
+	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+		feedReference := ps.ByName("feedReference")
 
-	feed, err := getFeedFromTitle(db, feedReference)
-	if err != nil {
-		io.WriteString(w, "Feed not found")
-		return
+		feed, err := getFeedFromTitle(db, feedReference)
+		if err != nil {
+			io.WriteString(w, "Feed not found")
+			return
+		}
+
+		atomFeed, err := renderFeed(db, feed, makeBasePath(r))
+		if err != nil {
+			http.Error(w, "Error rendering feed", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/atom+xml; charset=utf-8")
+		w.Header().Set("X-Robots-Tag", "noindex")
+
+		io.WriteString(w, atomFeed)
 	}
-
-	atomFeed := renderFeed(db, feed, makeBasePath(r))
-
-	w.Header().Set("Content-Type", "application/atom+xml; charset=utf-8")
-	w.Header().Set("X-Robots-Tag", "noindex")
-
-	io.WriteString(w, atomFeed)
 }
 
-func handleAlternate(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	entryReference := ps.ByName("entryReference")
-	db := openDb()
-	defer db.Close()
+func handleAlternate(db *sql.DB) httprouter.Handle {
+	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+		entryReference := ps.ByName("entryReference")
 
-	row := db.QueryRow(`SELECT "content" FROM entries WHERE reference = ?`, entryReference)
-	var content string
-	err := row.Scan(&content)
-	if err != nil {
-		io.WriteString(w, "Entry not found")
-		return
+		row := db.QueryRow(`SELECT "content" FROM entries WHERE reference = ?`, entryReference)
+		var content string
+		err := row.Scan(&content)
+		if err != nil {
+			io.WriteString(w, "Entry not found")
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("X-Robots-Tag", "noindex")
+
+		io.WriteString(w, content)
 	}
-
-	w.Header().Set("Content-Type", "text/html")
-	w.Header().Set("X-Robots-Tag", "noindex")
-
-	io.WriteString(w, content)
 }
 
 func getFeeds(db *sql.DB) []Feed {
 	entryRows, err := db.Query("SELECT * FROM feeds")
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Error querying feeds: %v", err)
+		return []Feed{}
 	}
 	defer entryRows.Close()
 
@@ -272,21 +295,20 @@ func getFeeds(db *sql.DB) []Feed {
 		feed := Feed{}
 		err = entryRows.Scan(&feed.id, &feed.createdAt, &feed.updatedAt, &feed.reference, &feed.title)
 		if err != nil {
-			log.Fatal(err)
+			log.Printf("Error scanning feed: %v", err)
+			continue
 		}
 		feeds = append(feeds, feed)
 	}
 	return feeds
 }
 
-func cleanup() {
-	db := openDb()
-	defer db.Close()
-
+func cleanup(db *sql.DB) {
 	log.Print("Running cleanup task")
 	_, err := db.Exec(`DELETE FROM entries WHERE createdAt < DATE('now', '-3 months')`)
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Error running 3 month cleanup: %v", err)
+		return
 	}
 	log.Print("3 Month Cleanup successful")
 
@@ -295,14 +317,19 @@ func cleanup() {
 	for _, feed := range feeds {
 		keepChecking := true
 		for keepChecking {
-			renderedFeed := renderFeed(db, feed, "http://google.com")
+			renderedFeed, err := renderFeed(db, feed, "http://google.com")
+			if err != nil {
+				log.Printf("Error rendering feed for cleanup check: %v", err)
+				break
+			}
 			feedLength := len(renderedFeed)
 			log.Printf("%v is %v bytes long\n", feed.title, feedLength)
 			if feedLength > 10000000 {
 				log.Println("That's too long. Deleting the last entry")
 				_, err := db.Exec(`DELETE FROM entries WHERE id = (SELECT id FROM entries WHERE feed = ? ORDER BY createdAt ASC LIMIT 1)`, feed.id)
 				if err != nil {
-					log.Fatal(err)
+					log.Printf("Error deleting old entry for feed cleanup: %v", err)
+					break
 				}
 				keepChecking = true
 			} else {
@@ -314,7 +341,9 @@ func cleanup() {
 }
 
 func main() {
-	initDb()
+	db := openDb()
+	defer db.Close()
+	initDb(db)
 
 	// Cleanup cron task
 	scheduler, err := gocron.NewScheduler()
@@ -325,7 +354,7 @@ func main() {
 		gocron.DurationJob(
 			24*time.Hour,
 		),
-		gocron.NewTask(cleanup),
+		gocron.NewTask(func() { cleanup(db) }),
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -342,7 +371,7 @@ func main() {
 	}
 
 	// SMTP Server
-	be := &Backend{}
+	be := &Backend{db: db}
 
 	s := smtp.NewServer(be)
 
@@ -359,8 +388,8 @@ func main() {
 
 	// HTTP Server
 	router := httprouter.New()
-	router.GET("/feeds/:feedReference", handleFeed)
-	router.GET("/alternates/:entryReference", handleAlternate)
+	router.GET("/feeds/:feedReference", handleFeed(db))
+	router.GET("/alternates/:entryReference", handleAlternate(db))
 
 	log.Println("Starting http server at", ":8080")
 	err = http.ListenAndServe(":8080", router)
