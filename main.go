@@ -62,17 +62,15 @@ func (s *Session) Data(r io.Reader) error {
 	log.Println("From:", email.Headers.From[0].Address)
 	log.Println("Subject:", email.Headers.Subject)
 
-	db := openDb()
-	defer db.Close()
 	feedTitle := strings.Split(email.Headers.To[0].Address, "@")[0]
-	feed, err := getFeedFromTitle(db, feedTitle)
+	feed, err := getFeedFromTitle(DB, feedTitle)
 	if err == ErrIDNotFound {
 		log.Println(feedTitle + " does not exist. Creating feed.")
-		_, err = db.Exec(`INSERT INTO feeds(reference, title) VALUES(?, ?)`, feedTitle, feedTitle)
+		_, err = DB.Exec(`INSERT INTO feeds(reference, title) VALUES(?, ?)`, feedTitle, feedTitle)
 		if err != nil {
 			log.Fatal(err)
 		}
-		feed, err = getFeedFromTitle(db, feedTitle)
+		feed, err = getFeedFromTitle(DB, feedTitle)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -80,7 +78,7 @@ func (s *Session) Data(r io.Reader) error {
 
 	title := email.Headers.Subject
 	author := email.Headers.From[0].Name
-	_, err = db.Exec(`INSERT INTO entries(reference, feed, title, author, content) 
+	_, err = DB.Exec(`INSERT INTO entries(reference, feed, title, author, content)
 	VALUES(?, ?, ?, ?, ?)`,
 		uuid.NewString(),
 		feed.id,
@@ -92,7 +90,7 @@ func (s *Session) Data(r io.Reader) error {
 		log.Fatal(err)
 	}
 
-	_, err = db.Exec(`UPDATE "feeds" SET "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = ?`, feed.id)
+	_, err = DB.Exec(`UPDATE "feeds" SET "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = ?`, feed.id)
 
 	if err != nil {
 		log.Fatal(err)
@@ -131,17 +129,16 @@ func getFeedFromTitle(db *sql.DB, title string) (Feed, error) {
 	return feed, nil
 }
 
-func openDb() *sql.DB {
-	db, err := sql.Open("sqlite3", "./go-go-gadget-newsletter.db")
+var DB *sql.DB
+
+func initDbConnection() {
+	var err error
+	DB, err = sql.Open("sqlite3", "./go-go-gadget-newsletter.db")
 	if err != nil {
 		log.Panic(err)
 	}
-	return db
 }
 func initDb() {
-	db := openDb()
-	defer db.Close()
-
 	sql := `
 	CREATE TABLE IF NOT EXISTS "feeds" (
         "id" INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,9 +160,8 @@ func initDb() {
 
 	CREATE INDEX IF NOT EXISTS "entriesFeed" ON "entries" ("feed");
 	`
-	_, err := db.Exec(sql)
+	_, err := DB.Exec(sql)
 	if err != nil {
-		db.Close()
 		log.Fatal(err)
 	}
 }
@@ -224,16 +220,14 @@ func renderFeed(db *sql.DB, feed Feed, basePath string) string {
 
 func handleFeed(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	feedReference := ps.ByName("feedReference")
-	db := openDb()
-	defer db.Close()
 
-	feed, err := getFeedFromTitle(db, feedReference)
+	feed, err := getFeedFromTitle(DB, feedReference)
 	if err != nil {
 		io.WriteString(w, "Feed not found")
 		return
 	}
 
-	atomFeed := renderFeed(db, feed, makeBasePath(r))
+	atomFeed := renderFeed(DB, feed, makeBasePath(r))
 
 	w.Header().Set("Content-Type", "application/atom+xml; charset=utf-8")
 	w.Header().Set("X-Robots-Tag", "noindex")
@@ -243,10 +237,8 @@ func handleFeed(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 
 func handleAlternate(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	entryReference := ps.ByName("entryReference")
-	db := openDb()
-	defer db.Close()
 
-	row := db.QueryRow(`SELECT "content" FROM entries WHERE reference = ?`, entryReference)
+	row := DB.QueryRow(`SELECT "content" FROM entries WHERE reference = ?`, entryReference)
 	var content string
 	err := row.Scan(&content)
 	if err != nil {
@@ -280,27 +272,24 @@ func getFeeds(db *sql.DB) []Feed {
 }
 
 func cleanup() {
-	db := openDb()
-	defer db.Close()
-
 	log.Print("Running cleanup task")
-	_, err := db.Exec(`DELETE FROM entries WHERE createdAt < DATE('now', '-3 months')`)
+	_, err := DB.Exec(`DELETE FROM entries WHERE createdAt < DATE('now', '-3 months')`)
 	if err != nil {
 		log.Fatal(err)
 	}
 	log.Print("3 Month Cleanup successful")
 
-	feeds := getFeeds(db)
+	feeds := getFeeds(DB)
 
 	for _, feed := range feeds {
 		keepChecking := true
 		for keepChecking {
-			renderedFeed := renderFeed(db, feed, "http://google.com")
+			renderedFeed := renderFeed(DB, feed, "http://google.com")
 			feedLength := len(renderedFeed)
 			log.Printf("%v is %v bytes long\n", feed.title, feedLength)
 			if feedLength > 10000000 {
 				log.Println("That's too long. Deleting the last entry")
-				_, err := db.Exec(`DELETE FROM entries WHERE id = (SELECT id FROM entries WHERE feed = ? ORDER BY createdAt ASC LIMIT 1)`, feed.id)
+				_, err := DB.Exec(`DELETE FROM entries WHERE id = (SELECT id FROM entries WHERE feed = ? ORDER BY createdAt ASC LIMIT 1)`, feed.id)
 				if err != nil {
 					log.Fatal(err)
 				}
@@ -314,6 +303,8 @@ func cleanup() {
 }
 
 func main() {
+	initDbConnection()
+	defer DB.Close()
 	initDb()
 
 	// Cleanup cron task
