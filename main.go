@@ -29,24 +29,18 @@ func (bkd *Backend) NewSession(_ *smtp.Conn) (smtp.Session, error) {
 
 // A Session is returned after EHLO.
 type Session struct {
-	auth bool
-	from string
-	to   string
 }
 
 func (s *Session) AuthPlain(username, password string) error {
 	// Don't care about auth
-	s.auth = true
 	return nil
 }
 
 func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
-	s.from = from
 	return nil
 }
 
 func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
-	s.to = to
 	return nil
 }
 
