@@ -4,6 +4,9 @@ After=network.target
 
 [Service]
 ExecStart=/home/ubuntu/newsletter-arm
+# The database path is relative to the working directory. systemd defaults to /,
+# which is where the existing database lives, so keep that explicit.
+WorkingDirectory=/
 User=root
 Restart=always
 

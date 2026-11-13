@@ -3,7 +3,7 @@ package main
 import (
 	"database/sql"
 	"errors"
-	"fmt"
+	"html"
 	"io"
 	"log"
 	"net/http"
@@ -20,23 +20,33 @@ import (
 	"github.com/emersion/go-smtp"
 )
 
+const (
+	dbPath          = "./go-go-gadget-newsletter.db"
+	entryRetention  = "-3 months"
+	cleanupInterval = 24 * time.Hour
+	maxFeedBytes    = 10000000
+	// Only affects the length of link URLs, so a placeholder of realistic length is close enough for sizing.
+	sizingBasePath = "https://example.com"
+)
+
 // The Backend implements SMTP server methods.
-type Backend struct{}
+type Backend struct {
+	db *sql.DB
+}
 
 func (bkd *Backend) NewSession(_ *smtp.Conn) (smtp.Session, error) {
-	return &Session{}, nil
+	return &Session{db: bkd.db}, nil
 }
 
 // A Session is returned after EHLO.
 type Session struct {
-	auth bool
+	db   *sql.DB
 	from string
-	to   string
+	to   []string
 }
 
 func (s *Session) AuthPlain(username, password string) error {
-	// Don't care about auth
-	s.auth = true
+	// Credentials are accepted but ignored: nothing is relayed, so there is nothing to protect.
 	return nil
 }
 
@@ -46,67 +56,109 @@ func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
 }
 
 func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
-	s.to = to
+	if _, err := feedNameFromAddress(to); err != nil {
+		return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 1, 1}, Message: "Invalid recipient"}
+	}
+	s.to = append(s.to, to)
 	return nil
 }
 
 func (s *Session) Data(r io.Reader) error {
 	email, err := letters.ParseEmail(r)
 	if err != nil {
-		log.Fatal(err)
+		log.Println("Could not parse email:", err)
+		return &smtp.SMTPError{Code: 554, EnhancedCode: smtp.EnhancedCode{5, 6, 0}, Message: "Message could not be parsed"}
 	}
 
 	log.Println("Received new email")
 	log.Println("Date:", email.Headers.Date)
-	log.Println("To:", email.Headers.To[0].Address)
-	log.Println("From:", email.Headers.From[0].Address)
+	log.Println("To:", s.to)
 	log.Println("Subject:", email.Headers.Subject)
 
-	db := openDb()
-	defer db.Close()
-	feedTitle := strings.Split(email.Headers.To[0].Address, "@")[0]
-	feed, err := getFeedFromTitle(db, feedTitle)
-	if err == ErrIDNotFound {
+	for _, to := range s.to {
+		feedTitle, err := feedNameFromAddress(to)
+		if err != nil {
+			return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 1, 1}, Message: "Invalid recipient"}
+		}
+		if err := deliver(s.db, feedTitle, &email); err != nil {
+			log.Println("Could not deliver to", feedTitle+":", err)
+			return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 3, 0}, Message: "Temporary failure, please retry"}
+		}
+	}
+	return nil
+}
+
+func (s *Session) Reset() {
+	s.from = ""
+	s.to = nil
+}
+
+func (s *Session) Logout() error {
+	return nil
+}
+
+func feedNameFromAddress(address string) (string, error) {
+	name, _, found := strings.Cut(address, "@")
+	if !found || name == "" {
+		return "", errors.New("invalid recipient address: " + address)
+	}
+	return name, nil
+}
+
+// entryContent prefers the HTML body and falls back to the plain text body, escaped and preformatted.
+func entryContent(email *letters.Email) string {
+	if email.HTML != "" {
+		return email.HTML
+	}
+	return `<pre style="white-space: pre-wrap">` + html.EscapeString(email.Text) + `</pre>`
+}
+
+func deliver(db *sql.DB, feedTitle string, email *letters.Email) error {
+	author := ""
+	if len(email.Headers.From) > 0 {
+		author = email.Headers.From[0].Name
+		if author == "" {
+			author = email.Headers.From[0].Address
+		}
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.Exec(`INSERT OR IGNORE INTO feeds(reference, title) VALUES(?, ?)`, feedTitle, feedTitle)
+	if err != nil {
+		return err
+	}
+	if created, _ := res.RowsAffected(); created > 0 {
 		log.Println(feedTitle + " does not exist. Creating feed.")
-		_, err = db.Exec(`INSERT INTO feeds(reference, title) VALUES(?, ?)`, feedTitle, feedTitle)
-		if err != nil {
-			log.Fatal(err)
-		}
-		feed, err = getFeedFromTitle(db, feedTitle)
-		if err != nil {
-			log.Fatal(err)
-		}
 	}
 
-	title := email.Headers.Subject
-	author := email.Headers.From[0].Name
-	_, err = db.Exec(`INSERT INTO entries(reference, feed, title, author, content) 
-	VALUES(?, ?, ?, ?, ?)`,
-		uuid.NewString(),
-		feed.id,
-		title,
-		author,
-		email.HTML)
-
+	feed, err := getFeedFromTitle(tx, feedTitle)
 	if err != nil {
-		log.Fatal(err)
-	}
-
-	_, err = db.Exec(`UPDATE "feeds" SET "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = ?`, feed.id)
-
-	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	// TODO: Consider capping the feed length.
 	// Kill-the-newsletter uses 500,000 bytes
-	return nil
-}
+	_, err = tx.Exec(`INSERT INTO entries(reference, feed, title, author, content) VALUES(?, ?, ?, ?, ?)`,
+		uuid.NewString(),
+		feed.id,
+		email.Headers.Subject,
+		author,
+		entryContent(email))
+	if err != nil {
+		return err
+	}
 
-func (s *Session) Reset() {}
+	_, err = tx.Exec(`UPDATE "feeds" SET "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = ?`, feed.id)
+	if err != nil {
+		return err
+	}
 
-func (s *Session) Logout() error {
-	return nil
+	return tx.Commit()
 }
 
 type Feed struct {
@@ -117,32 +169,29 @@ type Feed struct {
 	title     string
 }
 
-var ErrIDNotFound = errors.New("id not found")
+// querier is satisfied by both *sql.DB and *sql.Tx.
+type querier interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
 
-func getFeedFromTitle(db *sql.DB, title string) (Feed, error) {
-	row := db.QueryRow("SELECT * FROM feeds WHERE reference = ?", title)
+func getFeedFromTitle(q querier, title string) (Feed, error) {
+	row := q.QueryRow(`SELECT "id", "createdAt", "updatedAt", "reference", "title" FROM "feeds" WHERE "reference" = ?`, title)
 
 	feed := Feed{}
 	err := row.Scan(&feed.id, &feed.createdAt, &feed.updatedAt, &feed.reference, &feed.title)
 	if err != nil {
-		log.Println(err)
-		return Feed{}, ErrIDNotFound
+		return Feed{}, err
 	}
 	return feed, nil
 }
 
-func openDb() *sql.DB {
-	db, err := sql.Open("sqlite3", "./go-go-gadget-newsletter.db")
-	if err != nil {
-		log.Panic(err)
-	}
-	return db
+func openDb(path string) (*sql.DB, error) {
+	// WAL and a busy timeout let the SMTP handler and the cleanup job write without "database is locked" errors.
+	return sql.Open("sqlite3", path+"?_busy_timeout=5000&_journal_mode=WAL&_foreign_keys=on")
 }
-func initDb() {
-	db := openDb()
-	defer db.Close()
 
-	sql := `
+func initDb(db *sql.DB) error {
+	schema := `
 	CREATE TABLE IF NOT EXISTS "feeds" (
         "id" INTEGER PRIMARY KEY AUTOINCREMENT,
         "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -163,11 +212,8 @@ func initDb() {
 
 	CREATE INDEX IF NOT EXISTS "entriesFeed" ON "entries" ("feed");
 	`
-	_, err := db.Exec(sql)
-	if err != nil {
-		db.Close()
-		log.Fatal(err)
-	}
+	_, err := db.Exec(schema)
+	return err
 }
 
 func makeBasePath(r *http.Request) string {
@@ -182,7 +228,7 @@ func makeSelfRef(basePath string, path string, value string) string {
 	return basePath + "/" + path + "/" + value
 }
 
-func renderFeed(db *sql.DB, feed Feed, basePath string) string {
+func renderFeed(db *sql.DB, feed Feed, basePath string) (string, error) {
 	outputFeed := feeds.Feed{
 		Title:       feed.title,
 		Link:        &feeds.Link{Href: makeSelfRef(basePath, "feeds", feed.reference)},
@@ -190,12 +236,12 @@ func renderFeed(db *sql.DB, feed Feed, basePath string) string {
 		Author:      &feeds.Author{Name: feed.title},
 		Created:     feed.createdAt}
 
-	entryRows, err := db.Query(`SELECT "id", "createdAt", "reference", "title", "author", "content"
+	entryRows, err := db.Query(`SELECT "createdAt", "reference", "title", "author", "content"
 	FROM "entries"
 	WHERE "feed" = ?
 	ORDER BY "id" DESC`, feed.id)
 	if err != nil {
-		log.Fatal(err)
+		return "", err
 	}
 	defer entryRows.Close()
 
@@ -204,117 +250,216 @@ func renderFeed(db *sql.DB, feed Feed, basePath string) string {
 		item := feeds.Item{}
 		var reference string
 		var author string
-		err := entryRows.Scan(&item.Id, &item.Created, &reference, &item.Title, &author, &item.Content)
+		err := entryRows.Scan(&item.Created, &reference, &item.Title, &author, &item.Content)
 		if err != nil {
-			log.Fatal(err)
+			return "", err
 		}
+		// Atom IDs must be globally unique IRIs; the row id alone is not.
+		item.Id = "urn:uuid:" + reference
 		item.Author = &feeds.Author{Name: author}
 		item.Link = &feeds.Link{Href: makeSelfRef(basePath, "alternates", reference)}
 		item.Description = item.Content
 		outputFeedItems = append(outputFeedItems, &item)
 	}
+	if err := entryRows.Err(); err != nil {
+		return "", err
+	}
 	outputFeed.Items = outputFeedItems
-	atomFeed, err := (&feeds.Atom{Feed: &outputFeed}).ToAtom()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	return atomFeed
+	return (&feeds.Atom{Feed: &outputFeed}).ToAtom()
 }
 
-func handleFeed(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	feedReference := ps.ByName("feedReference")
-	db := openDb()
-	defer db.Close()
+func handleFeed(db *sql.DB) httprouter.Handle {
+	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+		feedReference := ps.ByName("feedReference")
 
-	feed, err := getFeedFromTitle(db, feedReference)
-	if err != nil {
-		io.WriteString(w, "Feed not found")
-		return
+		feed, err := getFeedFromTitle(db, feedReference)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "Feed not found", http.StatusNotFound)
+			return
+		}
+		if err != nil {
+			log.Println(err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		atomFeed, err := renderFeed(db, feed, makeBasePath(r))
+		if err != nil {
+			log.Println(err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/atom+xml; charset=utf-8")
+		w.Header().Set("X-Robots-Tag", "noindex")
+
+		io.WriteString(w, atomFeed)
 	}
-
-	atomFeed := renderFeed(db, feed, makeBasePath(r))
-
-	w.Header().Set("Content-Type", "application/atom+xml; charset=utf-8")
-	w.Header().Set("X-Robots-Tag", "noindex")
-
-	io.WriteString(w, atomFeed)
 }
 
-func handleAlternate(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	entryReference := ps.ByName("entryReference")
-	db := openDb()
-	defer db.Close()
+func handleAlternate(db *sql.DB) httprouter.Handle {
+	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+		entryReference := ps.ByName("entryReference")
 
-	row := db.QueryRow(`SELECT "content" FROM entries WHERE reference = ?`, entryReference)
-	var content string
-	err := row.Scan(&content)
-	if err != nil {
-		io.WriteString(w, "Entry not found")
-		return
+		var content string
+		err := db.QueryRow(`SELECT "content" FROM "entries" WHERE "reference" = ?`, entryReference).Scan(&content)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "Entry not found", http.StatusNotFound)
+			return
+		}
+		if err != nil {
+			log.Println(err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("X-Robots-Tag", "noindex")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		// Newsletter HTML is untrusted. The sandbox disables scripts, forms, and access to this origin's
+		// storage/cookies, but still lets images and styles load. Popups escape the sandbox so links open normally.
+		w.Header().Set("Content-Security-Policy", "sandbox allow-popups allow-popups-to-escape-sandbox")
+
+		io.WriteString(w, content)
 	}
-
-	w.Header().Set("Content-Type", "text/html")
-	w.Header().Set("X-Robots-Tag", "noindex")
-
-	io.WriteString(w, content)
 }
 
-func getFeeds(db *sql.DB) []Feed {
-	entryRows, err := db.Query("SELECT * FROM feeds")
+func getFeeds(db *sql.DB) ([]Feed, error) {
+	rows, err := db.Query(`SELECT "id", "createdAt", "updatedAt", "reference", "title" FROM "feeds"`)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	defer entryRows.Close()
+	defer rows.Close()
 
 	feeds := []Feed{}
-	for entryRows.Next() {
+	for rows.Next() {
 		feed := Feed{}
-		err = entryRows.Scan(&feed.id, &feed.createdAt, &feed.updatedAt, &feed.reference, &feed.title)
+		err = rows.Scan(&feed.id, &feed.createdAt, &feed.updatedAt, &feed.reference, &feed.title)
 		if err != nil {
-			log.Fatal(err)
+			return nil, err
 		}
 		feeds = append(feeds, feed)
 	}
-	return feeds
+	return feeds, rows.Err()
 }
 
-func cleanup() {
-	db := openDb()
-	defer db.Close()
-
+func cleanup(db *sql.DB) {
 	log.Print("Running cleanup task")
-	_, err := db.Exec(`DELETE FROM entries WHERE createdAt < DATE('now', '-3 months')`)
+	_, err := db.Exec(`DELETE FROM "entries" WHERE "createdAt" < DATETIME('now', ?)`, entryRetention)
 	if err != nil {
-		log.Fatal(err)
+		log.Println("Old entry cleanup failed:", err)
+		return
 	}
 	log.Print("3 Month Cleanup successful")
 
-	feeds := getFeeds(db)
+	feeds, err := getFeeds(db)
+	if err != nil {
+		log.Println("Could not load feeds for cleanup:", err)
+		return
+	}
 
 	for _, feed := range feeds {
-		keepChecking := true
-		for keepChecking {
-			renderedFeed := renderFeed(db, feed, "http://google.com")
-			feedLength := len(renderedFeed)
-			log.Printf("%v is %v bytes long\n", feed.title, feedLength)
-			if feedLength > 10000000 {
-				log.Println("That's too long. Deleting the last entry")
-				_, err := db.Exec(`DELETE FROM entries WHERE id = (SELECT id FROM entries WHERE feed = ? ORDER BY createdAt ASC LIMIT 1)`, feed.id)
-				if err != nil {
-					log.Fatal(err)
-				}
-				keepChecking = true
-			} else {
-				keepChecking = false
-			}
+		if err := trimFeed(db, feed); err != nil {
+			log.Println("Could not trim", feed.title+":", err)
 		}
-
 	}
 }
 
+// trimFeed removes the oldest entries until the rendered feed fits under maxFeedBytes.
+func trimFeed(db *sql.DB, feed Feed) error {
+	for {
+		rendered, err := renderFeed(db, feed, sizingBasePath)
+		if err != nil {
+			return err
+		}
+		overBy := len(rendered) - maxFeedBytes
+		if overBy <= 0 {
+			return nil
+		}
+		log.Printf("%v is %v bytes long, removing about %v bytes\n", feed.title, len(rendered), overBy)
+
+		stored, err := storedBytes(db, feed.id)
+		if err != nil {
+			return err
+		}
+		if stored == 0 {
+			return nil
+		}
+		// Rendered output is larger than the stored columns (content is escaped and emitted twice),
+		// so convert the overage into stored bytes using the ratio from this render.
+		bytesNeeded := max(overBy*stored/len(rendered), 1)
+
+		removed, err := removeOldestEntries(db, feed.id, bytesNeeded)
+		if err != nil {
+			return err
+		}
+		if removed == 0 {
+			return nil
+		}
+	}
+}
+
+func storedBytes(db *sql.DB, feedID int) (int, error) {
+	var total int
+	err := db.QueryRow(`SELECT COALESCE(SUM(LENGTH(CAST("title" AS BLOB)) + LENGTH(CAST("author" AS BLOB)) + LENGTH(CAST("content" AS BLOB))), 0)
+	FROM "entries"
+	WHERE "feed" = ?`, feedID).Scan(&total)
+	return total, err
+}
+
+// removeOldestEntries deletes oldest-first entries until about bytesNeeded has been freed.
+func removeOldestEntries(db *sql.DB, feedID int, bytesNeeded int) (int, error) {
+	rows, err := db.Query(`SELECT "id", LENGTH(CAST("title" AS BLOB)) + LENGTH(CAST("author" AS BLOB)) + LENGTH(CAST("content" AS BLOB))
+	FROM "entries"
+	WHERE "feed" = ?
+	ORDER BY "id" ASC`, feedID)
+	if err != nil {
+		return 0, err
+	}
+
+	var ids []int
+	freed := 0
+	for freed < bytesNeeded && rows.Next() {
+		var id, size int
+		if err := rows.Scan(&id, &size); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+		freed += size
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	for _, id := range ids {
+		if _, err := tx.Exec(`DELETE FROM "entries" WHERE "id" = ?`, id); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return len(ids), nil
+}
+
 func main() {
-	initDb()
+	db, err := openDb(dbPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := initDb(db); err != nil {
+		log.Fatal(err)
+	}
 
 	// Cleanup cron task
 	scheduler, err := gocron.NewScheduler()
@@ -323,15 +468,13 @@ func main() {
 	}
 	j, err := scheduler.NewJob(
 		gocron.DurationJob(
-			24*time.Hour,
+			cleanupInterval,
 		),
-		gocron.NewTask(cleanup),
+		gocron.NewTask(cleanup, db),
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
-	// each job has a unique id
-	fmt.Println(j.ID())
 
 	// start the scheduler
 	scheduler.Start()
@@ -342,7 +485,7 @@ func main() {
 	}
 
 	// SMTP Server
-	be := &Backend{}
+	be := &Backend{db: db}
 
 	s := smtp.NewServer(be)
 
@@ -355,15 +498,27 @@ func main() {
 	s.AllowInsecureAuth = true
 
 	log.Println("Starting mail server at", s.Addr)
-	go s.ListenAndServe()
+	go func() {
+		if err := s.ListenAndServe(); err != nil {
+			log.Fatal(err)
+		}
+	}()
 
 	// HTTP Server
 	router := httprouter.New()
-	router.GET("/feeds/:feedReference", handleFeed)
-	router.GET("/alternates/:entryReference", handleAlternate)
+	router.GET("/feeds/:feedReference", handleFeed(db))
+	router.GET("/alternates/:entryReference", handleAlternate(db))
 
-	log.Println("Starting http server at", ":8080")
-	err = http.ListenAndServe(":8080", router)
+	server := &http.Server{
+		Addr:              ":8080",
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	log.Println("Starting http server at", server.Addr)
+	err = server.ListenAndServe()
 	if err != nil {
 		log.Fatal(err)
 	}
