@@ -1,12 +1,18 @@
-.PHONY: all lint
+.PHONY: all lint test clean
 
 all: newsletter-arm newsletter-x86
 
 lint: 
 	staticcheck .
 
-newsletter-arm: *.go lint
-	CGO_ENABLED=1 CC_FOR_TARGET=gcc-aarch64-linux-gnu CC=aarch64-linux-gnu-gcc GOARCH=arm64 go build -o newsletter-arm
+test:
+	go test ./...
 
-newsletter-x86: *.go lint
+newsletter-arm: *.go lint test
+	CGO_ENABLED=1 CC=aarch64-linux-gnu-gcc GOARCH=arm64 go build -o newsletter-arm
+
+newsletter-x86: *.go lint test
 	go build -o newsletter-x86
+
+clean:
+	rm -f newsletter-arm newsletter-x86

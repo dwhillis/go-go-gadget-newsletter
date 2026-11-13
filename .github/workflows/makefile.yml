@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     - name: Get next version
       uses: reecetech/version-increment@2023.9.3
@@ -20,14 +20,19 @@ jobs:
       with:
         scheme: calver
 
-    - uses: actions/setup-go@v2
+    - uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
 
     - name: Install cross compiler
-      run: sudo apt install -y gcc-aarch64-linux-gnu; sudo dpkg --add-architecture armhf
+      run: sudo apt install -y gcc-aarch64-linux-gnu
 
     - uses: dominikh/staticcheck-action@v1
       with:
         version: "latest"
+
+    - name: Test
+      run: make test
 
     - name: Build
       run: make
